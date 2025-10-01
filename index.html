@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active Liveness & Emotion Detection</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        #videoContainer { position: relative; width: 640px; height: 480px; margin: 0 auto; }
+        #video, #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 0.75rem; }
+        #video { object-fit: cover; transform: scaleX(-1); }
+        #canvas { /* transform: scaleX(-1); */ } 
+        .progress-bar { transition: width 0.1s linear; }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="bg-slate-900 text-slate-200 flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div id="main-container" class="text-center w-full max-w-3xl">
+        <h1 id="main-title" class="text-3xl sm:text-4xl font-bold text-white mb-2">Active Liveness Detection</h1>
+        <p id="main-subtitle" class="text-slate-400 mb-6">Perform the action on screen to verify you're a real person.</p>
+        
+        <div id="videoContainer" class="bg-slate-800 rounded-xl shadow-lg mb-4">
+            <video id="video" autoplay muted playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div id="status-container" class="h-24 flex items-center justify-center">
+            <button id="startButton" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-lg transition duration-300">
+                Start Liveness Check
+            </button>
+            <div id="challenge-container" class="hidden text-center">
+                <p class="text-lg text-slate-300">Please perform this action:</p>
+                <p id="challenge-text" class="text-4xl font-bold text-amber-400 my-2"></p>
+                <div class="w-full bg-slate-700 rounded-full h-2.5"><div id="progress-bar" class="bg-amber-500 h-2.5 rounded-full progress-bar" style="width: 100%"></div></div>
+            </div>
+            <div id="success-container" class="hidden text-center">
+                <p class="text-4xl font-bold text-green-400">✅ Liveness Confirmed!</p>
+                <p class="text-lg text-slate-300 mt-2">Starting emotion analysis...</p>
+            </div>
+            <div id="failure-container" class="hidden text-center">
+                <p class="text-4xl font-bold text-red-400">❌ Liveness Failed</p>
+            </div>
+        </div>
+
+        <button id="resetButton" class="hidden mt-4 bg-slate-600 hover:bg-slate-700 text-white font-semibold py-2 px-5 rounded-lg transition duration-300">
+            Reset
+        </button>
+        <div id="error-message" class="hidden mt-4 bg-red-500/10 border border-red-500/30 text-red-400 px-4 py-3 rounded-lg"></div>
+    </div>
+
+    <script>
+        // --- DOM Elements ---
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const startButton = document.getElementById('startButton');
+        const resetButton = document.getElementById('resetButton');
+        const mainTitle = document.getElementById('main-title');
+        const mainSubtitle = document.getElementById('main-subtitle');
+        const challengeContainer = document.getElementById('challenge-container');
+        const successContainer = document.getElementById('success-container');
+        const failureContainer = document.getElementById('failure-container');
+        const challengeText = document.getElementById('challenge-text');
+        const progressBar = document.getElementById('progress-bar');
+        const errorMessage = document.getElementById('error-message');
+
+        // --- State Variables ---
+        let livenessInterval = null;
+        let countdownInterval = null;
+        let isProcessingFrame = false;
+        let isAnalysisRunning = false;
+        const CHALLENGE_TIME = 5000;
+        let isChallengeOver = false; // --- CHANGE: State to prevent race conditions ---
+
+        // --- Event Listeners ---
+        startButton.addEventListener('click', startLivenessCheck);
+        resetButton.addEventListener('click', resetUI);
+
+        // --- Core Logic ---
+        async function startLivenessCheck() {
+            startButton.classList.add('hidden');
+            isChallengeOver = false; // --- CHANGE: Reset the state lock ---
+            if (!await startWebcam()) return;
+            try {
+                const response = await fetch('/get_challenge');
+                runChallenge((await response.json()).challenge);
+            } catch (error) { showError("Could not connect to the server."); }
+        }
+
+        function runChallenge(challenge) {
+            displayChallenge(challenge);
+            const startTime = Date.now();
+            livenessInterval = setInterval(async () => {
+                if (isChallengeOver) return; // If race is over, do nothing
+                const success = await sendFrameForVerification(challenge);
+                if (success && !isChallengeOver) {
+                    isChallengeOver = true; // Set the lock
+                    stopAllProcessing();
+                    showSuccess();
+                }
+            }, 250);
+            countdownInterval = setInterval(() => {
+                if (isChallengeOver) return; // If race is over, do nothing
+                const remainingTime = Math.max(0, CHALLENGE_TIME - (Date.now() - startTime));
+                progressBar.style.width = `${(remainingTime / CHALLENGE_TIME) * 100}%`;
+                if (remainingTime <= 0 && !isChallengeOver) {
+                    isChallengeOver = true; // Set the lock
+                    stopAllProcessing();
+                    showFailure();
+                }
+            }, 100);
+        }
+        
+        async function emotionAnalysisLoop() {
+            if (!isAnalysisRunning) return;
+            if (!isProcessingFrame) {
+                isProcessingFrame = true;
+                const imageData = captureFrame();
+                if (imageData) {
+                    try {
+                        const response = await fetch('/analyze_emotion', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ image: imageData })
+                        });
+                        const result = await response.json();
+                        drawEmotionResults(result);
+                    } catch (error) {
+                        console.error("Emotion analysis error:", error);
+                        isAnalysisRunning = false;
+                        showError("Connection lost during analysis.");
+                    } finally {
+                        isProcessingFrame = false;
+                    }
+                } else {
+                    isProcessingFrame = false;
+                }
+            }
+            requestAnimationFrame(emotionAnalysisLoop);
+        }
+
+        async function sendFrameForVerification(challenge) {
+            const imageData = captureFrame();
+            if (!imageData) return false;
+            try {
+                const response = await fetch('/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: imageData, challenge: challenge })
+                });
+                return (await response.json()).success;
+            } catch (error) {
+                if (!isChallengeOver) {
+                    isChallengeOver = true;
+                    console.error("Verification error:", error);
+                    stopAllProcessing();
+                    showError("Server connection lost.");
+                }
+                return false;
+            }
+        }
+
+        function captureFrame() {
+            if (video.paused || video.ended || !video.videoWidth) return null;
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = video.videoWidth;
+            tempCanvas.height = video.videoHeight;
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+            return tempCanvas.toDataURL('image/jpeg', 0.8);
+        }
+
+        function drawEmotionResults(result) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (result.box && result.box.length === 4) {
+                const [startX, startY, endX, endY] = result.box;
+                const boxWidth = endX - startX;
+                const boxHeight = endY - startY;
+                const mirroredX = canvas.width - endX;
+                const label = `Emotion: ${result.emotion}`;
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(mirroredX, startY, boxWidth, boxHeight);
+                ctx.fillStyle = '#22c55e';
+                const textWidth = ctx.measureText(label).width;
+                ctx.fillRect(mirroredX, startY - 25, textWidth + 10, 25);
+                ctx.fillStyle = 'black';
+                ctx.font = '16px Inter';
+                ctx.fillText(label, mirroredX + 5, startY - 8);
+            }
+        }
+
+        function displayChallenge(challenge) {
+            challengeContainer.classList.remove('hidden');
+            challengeText.innerText = challenge;
+            progressBar.style.width = '100%';
+        }
+
+        function showSuccess() {
+            challengeContainer.classList.add('hidden');
+            successContainer.classList.remove('hidden');
+            setTimeout(() => {
+                successContainer.classList.add('hidden');
+                resetButton.classList.remove('hidden');
+                mainTitle.innerText = "Live Emotion Analysis";
+                mainSubtitle.innerText = "Your emotion is being detected in real-time.";
+                isAnalysisRunning = true;
+                emotionAnalysisLoop();
+            }, 2000);
+        }
+
+        function showFailure() {
+            challengeContainer.classList.add('hidden');
+            failureContainer.classList.remove('hidden');
+            resetButton.classList.remove('hidden');
+        }
+
+        function resetUI() {
+            stopAllProcessing();
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+            mainTitle.innerText = "Active Liveness Detection";
+            mainSubtitle.innerText = "Perform the action on screen to verify you're a real person.";
+            failureContainer.classList.add('hidden');
+            successContainer.classList.add('hidden');
+            challengeContainer.classList.add('hidden');
+            resetButton.classList.add('hidden');
+            startButton.classList.remove('hidden');
+        }
+
+        function stopAllProcessing() {
+            clearInterval(livenessInterval);
+            clearInterval(countdownInterval);
+            isAnalysisRunning = false;
+        }
+
+        function showError(message) {
+            errorMessage.classList.remove('hidden');
+            errorMessage.textContent = message;
+        }
+
+        async function startWebcam() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+                video.srcObject = stream;
+                await new Promise(resolve => {
+                    video.onloadedmetadata = () => {
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        resolve();
+                    };
+                });
+                return true;
+            } catch (err) {
+                showError("Could not access camera. Please grant permission and refresh.");
+                return false;
+            }
+        }
+    </script>
+</body>
+</html>
+
