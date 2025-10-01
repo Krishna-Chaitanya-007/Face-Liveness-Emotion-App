@@ -1,0 +1,14 @@
+Python
+pycache/
+*.pyc
+*.pyo
+*.pyd
+
+Environment
+.env
+venv/
+env/
+
+IDE / Editor specific
+.vscode/
+.idea/
